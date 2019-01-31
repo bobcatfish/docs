@@ -25,6 +25,8 @@ The following Knative components are available:
 
 - [Build](https://github.com/knative/build) - Source-to-container build
   orchestration
+- [Pipeline](https://github.com/knative/build-pipeline) - CI/CD build
+  orchestration
 - [Eventing](https://github.com/knative/eventing) - Management and delivery of
   events
 - [Serving](https://github.com/knative/serving) - Request-driven compute that
@@ -79,6 +81,7 @@ Follow the links below to learn more about Knative.
 - [Getting started with app deployment](./install/getting-started-knative-app.md)
 - [Getting started with serving](./serving)
 - [Getting started with builds](./build)
+- [Getting started with pipelines](./pipeline)
 - [Getting started with eventing](./eventing)
 
 ### Configuration and networking
