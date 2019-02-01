@@ -5,18 +5,20 @@ This document defines `Tasks` and their capabilities.
 ---
 
 - [What is a Task?](#what-is-a-task)
+- [ClusterTasks](#clustertask)
 - [Syntax](#syntax)
   - [Steps](#steps)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
-  - [Service Account](#service-account)
+  - [Controlling where resources are mounted](#controlling-where-resources-are-mounted)
+  - [Overriding where resources are copied from](#overriding-where-resources-are-copied-from)
   - [Volumes](#volumes)
   - [Templating](#templating)
 - [Examples](#examples)
 
 ## What is a Task?
 
-A `Task` (or a `ClusterTask`) is a collection of sequential steps you would want to run as part of
+A `Task` (or a [`ClusterTask`](#clustertask)) is a collection of sequential steps you would want to run as part of
 your continuous integration flow. A task will run inside a container on your
 cluster.
 
@@ -27,6 +29,28 @@ A `Task` declares:
 - [Steps](#steps)
 
 A `Task` is available within a namespace, and `ClusterTask` is available across entire Kubernetes cluster.
+
+## ClusterTask
+
+Similar to Task, but with a cluster scope.
+
+In case of using a ClusterTask, the `TaskRef` kind should be added. The default
+kind is Task which represents a namespaced Task
+
+```yaml
+apiVersion: pipeline.knative.dev/v1alpha1
+kind: Pipeline
+metadata:
+  name: demo-pipeline
+  namespace: default
+spec:
+  tasks:
+    - name: build-skaffold-web
+      taskRef:
+        name: build-push
+        kind: ClusterTask
+      params: ....
+```
 
 A `Task` functions exactly like a `ClusterTask`, and as such all references to `Task` below are also describing `ClusterTask`.
 
@@ -56,6 +80,10 @@ following fields:
   - [`volumes`](#volumes) - Specifies one or more volumes that you want to make
     available to your build.
   - [`timeout`](#timeout) - Specifies timeout after which the Task will fail.
+  - [`nodeSelector`] - a selector which must be true for the pod to fit on a node.
+     The selector which must match a node's labels for the pod to be scheduled on that node.
+     More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
+  - [`affinity`] - the pod's scheduling constraints. More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#node-affinity-beta-feature
 
 [kubernetes-overview]:
   https://kubernetes.io/docs/concepts/overview/working-with-objects/kubernetes-objects/#required-fields
@@ -193,169 +221,277 @@ resources are mounted at can be overridden with the `targetPath` value.
 
 ### Outputs
 
-Output [`PipelineResources`](resources.md), are expected in directory path
-`/workspace/output/resource_name`.
+`Task` definitions can include inputs and outputs [`PipelineResource`](resources.md) 
+declarations. If specific set of resources are only declared in output then a copy
+of resource to be uploaded or shared for next Task is expected to be present under
+the path `/workspace/output/resource_name/`.
 
-- If resource has an output "action" like upload to blob storage, then the
-  container step is added for this action.
-- If there is PVC volume present (TaskRun holds owner reference to PipelineRun)
-  then copy step is added as well.
+```yaml
+resources:
+  outputs:
+    name: storage-gcs
+    type: gcs
+steps:
+  - image: objectuser/run-java-jar #https://hub.docker.com/r/objectuser/run-java-jar/
+    command: [jar]
+    args:
+      ["-cvf", "-o", "/workspace/output/storage-gcs/", "projectname.war", "*"]
+    env:
+      - name: "FOO"
+        value: "world"
+```
 
-- If the resource is declared only in output but not in input for task then the
-  copy step includes resource being copied to PVC to path
-  `/pvc/task_name/resource_name` from `/workspace/output/resource_name` like the
-  following example.
+**note**: if the task is relying on output resource functionality then the containers
+in the task `steps` field cannot mount anything in the path `/workspace/output`.
 
-  ```yaml
-  kind: Task
-  metadata:
-    name: get-gcs-task
-    namespace: default
-  spec:
-    outputs:
-      resources:
-        - name: gcs-workspace
-          type: storage
-  ```
+In the following example Task `tar-artifact` resource is used both as input and
+output so input resource is downloaded into directory `customworkspace`(as
+specified in [`targetPath`](#targetpath)). Step `untar` extracts tar file into
+`tar-scratch-space` directory , `edit-tar` adds a new file and last step
+`tar-it-up` creates new tar file and places in `/workspace/customworkspace/`
+directory. After execution of the Task steps, (new) tar file in directory
+`/workspace/customworkspace` will be uploaded to the bucket defined in
+`tar-artifact` resource definition.
 
-- If the resource is declared both in input and output for task the then copy
-  step includes resource being copied to PVC to path
-  `/pvc/task_name/resource_name` from `/workspace/random-space/` if input
-  resource has custom target directory (`random-space`) declared like the
-  following example.
+```yaml
+resources:
+  inputs:
+    name: tar-artifact
+    targetPath: customworkspace
+  outputs:
+    name: tar-artifact
+steps:
+ - name: untar
+    image: ubuntu
+    command: ["/bin/bash"]
+    args: ['-c', 'mkdir -p /workspace/tar-scratch-space/ && tar -xvf /workspace/customworkspace/rules_docker-master.tar -C /workspace/tar-scratch-space/']
+ - name: edit-tar
+    image: ubuntu
+    command: ["/bin/bash"]
+    args: ['-c', 'echo crazy > /workspace/tar-scratch-space/rules_docker-master/crazy.txt']
+ - name: tar-it-up
+   image: ubuntu
+   command: ["/bin/bash"]
+   args: ['-c', 'cd /workspace/tar-scratch-space/ && tar -cvf /workspace/customworkspace/rules_docker-master.tar rules_docker-master']
+```
 
-  ```yaml
-  kind: Task
-  metadata:
-    name: get-gcs-task
-    namespace: default
-  spec:
-    inputs:
-      resources:
-        - name: gcs-workspace
-          type: storage
-          targetPath: random-space
-    outputs:
-      resources:
-        - name: gcs-workspace
-          type: storage
-  ```
+### Overriding where resources are copied from
 
-  - If resource is declared both in input and output for task without custom
-    target directory then copy step includes resource being copied to PVC to
-    path `/pvc/task_name/resource_name` from `/workspace/random-space/` like the
-    following example.
+When specifying input and output `PipelineResources`, you can optionally specify
+`paths` for each resource. `paths` will be used by `TaskRun` as the resource's
+new source paths i.e., copy the resource from specified list of paths. `TaskRun`
+expects the folder and contents to be already present in specified paths.
+`paths` feature could be used to provide extra files or altered version of
+existing resource before execution of steps.
 
-  ```yaml
-  kind: Task
-  metadata:
-    name: get-gcs-task
-    namespace: default
-  spec:
-    inputs:
-      resources:
-        - name: gcs-workspace
-          type: storage
-    outputs:
-      resources:
-        - name: gcs-workspace
-          type: storage
-  ```
+Output resource includes name and reference to pipeline resource and optionally
+`paths`. `paths` will be used by `TaskRun` as the resource's new destination
+paths i.e., copy the resource entirely to specified paths. `TaskRun` will be
+responsible for creating required directories and copying contents over. `paths`
+feature could be used to inspect the results of taskrun after execution of
+steps.
 
-### Service Account
+`paths` feature for input and output resource is heavily used to pass same
+version of resources across tasks in context of pipelinerun.
 
-Specifies the `name` of a `ServiceAccount` resource object. Use the
-`serviceAccount` field to run your `Task` with the privileges of the
-specified service account. If no `serviceAccount` field is specified, your
-`Task` runs using the
-[`default` service account](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#use-the-default-service-account-to-access-the-api-server)
-that is in the
-[namespace](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/)
-of the `Task` resource object.
+In the following example, task and taskrun are defined with input resource,
+output resource and step which builds war artifact. After execution of
+taskrun(`volume-taskrun`), `custom` volume will have entire resource
+`java-git-resource` (including the war artifact) copied to the destination path
+`/custom/workspace/`.
 
-For examples and more information about specifying service accounts, see the
-[`ServiceAccount`](./auth.md) reference topic.
+```yaml
+apiVersion: pipeline.knative.dev/v1alpha1
+kind: Task
+metadata:
+  name: volume-task
+  namespace: default
+spec:
+  generation: 1
+  inputs:
+    resources:
+      - name: workspace
+        type: git
+  steps:
+    - name: build-war
+      image: objectuser/run-java-jar #https://hub.docker.com/r/objectuser/run-java-jar/
+      command: jar
+      args: ["-cvf", "projectname.war", "*"]
+      volumeMounts:
+        - name: custom-volume
+          mountPath: /custom
+```
+
+```yaml
+apiVersion: pipeline.knative.dev/v1alpha1
+kind: TaskRun
+metadata:
+  name: volume-taskrun
+  namespace: default
+spec:
+  taskRef:
+    name: volume-task
+  inputs:
+    resources:
+      - name: workspace
+        resourceRef:
+          name: java-git-resource
+  outputs:
+    resources:
+      - name: workspace
+        paths:
+          - /custom/workspace/
+        resourceRef:
+          name: java-git-resource
+  volumes:
+    - name: custom-volume
+      emptyDir: {}
+```
+
+### Controlling where resources are mounted
+
+Tasks can opitionally provide `targetPath` to initialize resource in specific
+directory. If `targetPath` is set then resource will be initialized under
+`/workspace/targetPath`. If `targetPath` is not specified then resource will be
+initialized under `/workspace`. Following example demonstrates how git input
+repository could be initialized in `$GOPATH` to run tests:
+
+```yaml
+apiVersion: pipeline.knative.dev/v1alpha1
+kind: Task
+metadata:
+  name: task-with-input
+  namespace: default
+spec:
+  inputs:
+    resources:
+      - name: workspace
+        type: git
+        targetPath: go/src/github.com/knative/build-pipeline
+  steps:
+    - name: unit-tests
+      image: golang
+      command: ["go"]
+      args:
+        - "test"
+        - "./..."
+      workingDir: "/workspace/go/src/github.com/knative/build-pipeline"
+      env:
+        - name: GOPATH
+          value: /workspace/go
+```
 
 ### Volumes
 
-Optional. Specifies one or more
+Specifies one or more
 [volumes](https://kubernetes.io/docs/concepts/storage/volumes/) that you want to
-make available to your build, including all the build steps. Add volumes to
-complement the volumes that are implicitly
-[created during a build step](./builder-contract.md).
+make available to your `Task`, including all the [`steps`](#steps). Add volumes to
+complement the volumes that are implicitly created for [input resources](#input-resources)
+and [output resources](#outputs).
 
 For example, use volumes to accomplish one of the following common tasks:
 
 - [Mount a Kubernetes secret](./auth.md).
-
 - Create an `emptyDir` volume to act as a cache for use across multiple build
   steps. Consider using a persistent volume for inter-build caching.
-
 - Mount a host's Docker socket to use a `Dockerfile` for container image builds.
+  **Note:** Building a container image using `docker build` on-cluster is _very
+  unsafe_. Use [kaniko](https://github.com/GoogleContainerTools/kaniko) instead.
+  This is used only for the purposes of demonstration.
 
 ### Templating
 
+`Tasks` support templating using values from all [`inputs`](#inputs) and [`outputs`](#outputs),
+
+[`PipelineResources`](resources.md) can be referenced in a `Task` spec like this, where `<name>` is the
+Resource Name and `<key>` is a one of the resource's `params`:
+
+```shell
+${inputs.resources.<name>.<key>}
+```
+
+Or for an output resource:
+
+```shell
+${outputs.resources.<name>.<key>}
+```
+
+To access an input parameter, replace `resources` with `params` as below:
+
+```shell
+${inputs.params.<name>}
+```
+
 ## Examples
 
-Use these code snippets to help you understand how to define your Knative
-builds.
+Use these code snippets to help you understand how to define your `Tasks`.
 
-Tip: See the collection of simple
-[test builds](https://github.com/knative/build/tree/master/test) for additional
-code samples, including working copies of the following snippets:
-
-- [`git` as `source`](#using-git)
-- [`gcs` as `source`](#using-gcs)
-- [`custom` as `source`](#using-custom)
+- [Example of image building and pushing](#example-task)
 - [Mounting extra volumes](#using-an-extra-volume)
-- [Pushing an image](#using-steps-to-push-images)
 - [Authenticating with `ServiceAccount`](#using-a-serviceaccount)
-- [Timeout](#using-timeout)
 
-#### Using `git`
+_Tip: See the collection of simple
+[examples](https://github.com/knative/build-pipeline/tree/master/examples) for additional
+code samples._
 
-Specifying `git` as your `source`:
+### Example Task
 
-```yaml
-spec:
-  source:
-    git:
-      url: https://github.com/knative/build.git
-      revision: master
-  steps:
-    - image: ubuntu
-      args: ["cat", "README.md"]
-```
+For example, a `Task` to encapsulate a `Dockerfile` build might look
+something like this:
 
-#### Using `gcs`
-
-Specifying `gcs` as your `source`:
+**Note:** Building a container image using `docker build` on-cluster is _very
+unsafe_. Use [kaniko](https://github.com/GoogleContainerTools/kaniko) instead.
+This is used only for the purposes of demonstration.
 
 ```yaml
 spec:
-  source:
-    gcs:
-      type: Archive
-      location: gs://build-crd-tests/rules_docker-master.zip
+  inputs:
+    resources:
+    - name: workspace
+      type: git
+    params:
+    # These may be overridden, but provide sensible defaults.
+    - name: directory
+      description: The directory containing the build context.
+      default: /workspace
+    - name: dockerfileName
+      description: The name of the Dockerfile
+      default: Dockerfile
+  outputs:
+    resources:
+    - name: builtImage
+      type: image
   steps:
-    - name: list-files
-      image: ubuntu:latest
-      args: ["ls"]
-```
+    - name: dockerfile-build
+      image: gcr.io/cloud-builders/docker
+      workingDir: "${inputs.params.directory}"
+      args:
+        [
+          "build",
+          "--no-cache",
+          "--tag",
+          "${outputs.resources.image}",
+          "--file",
+          "${inputs.params.dockerfileName}",
+          ".",
+        ]
+      volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
 
-#### Using `custom`
+    - name: dockerfile-push
+      image: gcr.io/cloud-builders/docker
+      args: ["push", "${outputs.resources.image}"]
+      volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
 
-Specifying `custom` as your `source`:
-
-```yaml
-spec:
-  source:
-    custom:
-      image: gcr.io/cloud-builders/gsutil
-      args: ["rsync", "gs://some-bucket", "."]
-  steps:
-    - image: ubuntu
-      args: ["cat", "README.md"]
+  # As an implementation detail, this template mounts the host's daemon socket.
+  volumes:
+    - name: docker-socket
+      hostPath:
+        path: /var/run/docker.sock
+        type: Socket
 ```
 
 #### Using an extra volume
@@ -382,264 +518,6 @@ spec:
     - name: my-volume
       emptyDir: {}
 ```
-
-#### Using `steps` to push images
-
-Defining a `steps` to push a container image to a repository.
-
-```yaml
-spec:
-  parameters:
-    - name: IMAGE
-      description: The name of the image to push
-    - name: DOCKERFILE
-      description: Path to the Dockerfile to build.
-      default: /workspace/Dockerfile
-  steps:
-    - name: build-and-push
-      image: gcr.io/kaniko-project/executor
-      args:
-        - --dockerfile=${DOCKERFILE}
-        - --destination=${IMAGE}
-```
-
-#### Using a `ServiceAccount`
-
-Specifying a `ServiceAccount` to access a private `git` repository:
-
-```yaml
-apiVersion: build.knative.dev/v1alpha1
-kind: Build
-metadata:
-  name: test-build-with-serviceaccount-git-ssh
-  labels:
-    expect: succeeded
-spec:
-  serviceAccountName: test-build-robot-git-ssh
-  source:
-    git:
-      url: git@github.com:knative/build.git
-      revision: master
-
-  steps:
-    - name: config
-      image: ubuntu
-      command: ["/bin/bash"]
-      args: ["-c", "cat README.md"]
-```
-
-Where `serviceAccountName: test-build-robot-git-ssh` references the following
-`ServiceAccount`:
-
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: test-build-robot-git-ssh
-secrets:
-  - name: test-git-ssh
-```
-
-And `name: test-git-ssh`, references the following `Secret`:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: test-git-ssh
-  annotations:
-    build.knative.dev/git-0: github.com
-type: kubernetes.io/ssh-auth
-data:
-  # Generated by:
-  # cat id_rsa | base64 -w 0
-  ssh-privatekey: LS0tLS1CRUdJTiBSU0EgUFJJVk.....[example]
-  # Generated by:
-  # ssh-keyscan github.com | base64 -w 0
-  known_hosts: Z2l0aHViLmNvbSBzc2g.....[example]
-```
-
-Note: For a working copy of this `ServiceAccount` example, see the
-[build/test/git-ssh](https://github.com/knative/build/tree/master/test/git-ssh)
-code sample.
-
-#### Using `timeout`
-
-Specifying `timeout` for your `build`:
-
-```yaml
-spec:
-  timeout: 20m
-  source:
-    git:
-      url: https://github.com/knative/build.git
-      revision: master
-  steps:
-    - image: ubuntu
-      args: ["cat", "README.md"]
-```
-
-### Example Task
-
-For example, a `Task` to encapsulate a `Dockerfile` build might look
-something like this:
-
-**Note:** Building a container image using `docker build` on-cluster is _very
-unsafe_. Use [kaniko](https://github.com/GoogleContainerTools/kaniko) instead.
-This is used only for the purposes of demonstration.
-
-```yaml
-spec:
-  params:
-    # This has no default, and is therefore required.
-    - name: IMAGE
-      description: Where to publish the resulting image.
-
-    # These may be overridden, but provide sensible defaults.
-    - name: DIRECTORY
-      description: The directory containing the build context.
-      default: /workspace
-    - name: DOCKERFILE_NAME
-      description: The name of the Dockerfile
-      default: Dockerfile
-
-  steps:
-    - name: dockerfile-build
-      image: gcr.io/cloud-builders/docker
-      workingDir: "${DIRECTORY}"
-      args:
-        [
-          "build",
-          "--no-cache",
-          "--tag",
-          "${IMAGE}",
-          "--file",
-          "${DOCKERFILE_NAME}",
-          ".",
-        ]
-      volumeMounts:
-        - name: docker-socket
-          mountPath: /var/run/docker.sock
-
-    - name: dockerfile-push
-      image: gcr.io/cloud-builders/docker
-      args: ["push", "${IMAGE}"]
-      volumeMounts:
-        - name: docker-socket
-          mountPath: /var/run/docker.sock
-
-  # As an implementation detail, this template mounts the host's daemon socket.
-  volumes:
-    - name: docker-socket
-      hostPath:
-        path: /var/run/docker.sock
-        type: Socket
-```
-
-In this example, `params` describes arguments for the `Task`.
-The `description` is used for diagnostic messages during validation (and maybe
-in the future for UI). The `default` value enables a template to have a
-graduated complexity, where options are overridden only when the user strays
-from some set of sane defaults.
-
-### Example TaskRuns
-
-For the sake of illustrating re-use, here are several example [`TaskRuns`](taskrun.md)
-(including referenced [`PipelineResources`](resource.md)) instantiating the `Task` above
-(`dockerfile-build-and-push`).
-
-Build `mchmarny/rester-tester`:
-
-```yaml
-# The PipelineResource
-metadata:
-  name: mchmarny-repo
-spec:        
-  type: git
-  params:
-  - name: url
-    value: https://github.com/mchmarny/rester-tester.git
-```
-
-```yaml
-# The TaskRun
-spec:
-  taskRef:
-    name: dockerfile-build-and-push
-  inputs:
-    resources:
-      - name: workspace
-        resourceRef:
-          name: mchmarny-repo
-    params:
-    - name: IMAGE
-      value: gcr.io/my-project/rester-tester
-```
-
-Build `googlecloudplatform/cloud-builder`'s `wget` builder:
-
-```yaml
-# The PipelineResource
-metadata:
-  name: cloud-builder-repo
-spec:        
-  type: git
-  params:
-  - name: url
-    value: https://github.com/googlecloudplatform/cloud-builders.git
-```
-
-```yaml
-# The TaskRun
-spec:
-  taskRef:
-    name: dockerfile-build-and-push
-  inputs:
-    resources:
-      - name: workspace
-        resourceRef:
-          name: cloud-builder-repo
-    params:
-      - name: IMAGE
-        value: gcr.io/my-project/wget
-      # Optional override to specify the subdirectory containing the Dockerfile
-      - name: DIRECTORY
-        value: /workspace/wget
-```
-
-Build `googlecloudplatform/cloud-builder`'s `docker` builder with `17.06.1`:
-
-```yaml
-# The PipelineResource
-metadata:
-  name: cloud-builder-repo
-spec:        
-  type: git
-  params:
-  - name: url
-    value: https://github.com/googlecloudplatform/cloud-builders.git
-```
-
-```yaml
-# The TaskRun
-spec:
-  taskRef:
-    name: dockerfile-build-and-push
-  inputs:
-    resources:
-      - name: workspace
-        resourceRef:
-          name: cloud-builder-repo
-    params:
-      - name: IMAGE
-        value: gcr.io/my-project/docker
-      # Optional overrides
-      - name: DIRECTORY
-        value: /workspace/docker
-      - name: DOCKERFILE_NAME
-        value: Dockerfile-17.06.1
-```
-
 ---
 
 Except as otherwise noted, the content of this page is licensed under the
